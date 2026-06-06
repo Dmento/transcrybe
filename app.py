@@ -196,7 +196,9 @@ class AzureLiveTranscriber(AudioProcessorBase):
         except Exception as err:  # don't let a frame error kill the stream silently
             with self._lock:
                 self.errors.append(f"frame handling: {err}")
-        return frames[-1] if frames else None
+        # MUST return a LIST of frames: the library does out_deque.extend(result).
+        # Returning a single frame (or None) crashes the worker after one batch.
+        return frames
 
     def get_status(self):
         with self._lock:
@@ -298,17 +300,16 @@ def render_realtime_section():
         st.info("🔴 Listening… speak now.")
         if ctx.audio_processor:
             text = ctx.audio_processor.get_transcript()
-            transcript_box.text_area("Live transcript", text, height=300, key="rt_text")
+            # Use markdown (not a keyed text_area): a widget with a key ignores
+            # its `value` after first render, so a live-updating text_area would
+            # stay frozen on its initial (empty) value.
+            transcript_box.markdown(
+                f"**Live transcript:**\n\n{text if text else '_(listening…)_'}"
+            )
             # Remember it so it stays visible after you click STOP.
             st.session_state["live_transcript"] = text
 
-            # Diagnostics: shows whether audio is reaching the server / Azure.
-            frames_in, bytes_pushed, errors = ctx.audio_processor.get_status()
-            st.caption(
-                f"🔎 audio frames received: {frames_in} · "
-                f"PCM bytes sent to Azure: {bytes_pushed:,}"
-            )
-            for err in errors:
+            for err in ctx.audio_processor.get_status()[2]:
                 st.error(f"Azure error: {err}")
         else:
             st.warning("Connecting… if this persists, the audio stream isn't reaching the server.")
@@ -317,7 +318,9 @@ def render_realtime_section():
         st.rerun()
     else:
         final = st.session_state.get("live_transcript", "")
-        transcript_box.text_area("Live transcript", final, height=300, key="rt_text_final")
+        transcript_box.markdown(
+            f"**Live transcript:**\n\n{final if final else '_(nothing recorded yet)_'}"
+        )
         if final:
             st.download_button(
                 "⬇️ Download transcript (.txt)",
