@@ -138,6 +138,11 @@ class AzureLiveTranscriber(AudioProcessorBase):
             format="s16", layout="mono", rate=16000
         )
 
+        # Diagnostics so we can see whether audio is actually flowing.
+        self.frames_in = 0     # audio frames received from the browser
+        self.bytes_pushed = 0  # PCM bytes sent to Azure
+        self.errors = []       # any errors from Azure or frame handling
+
         audio_format = speechsdk.audio.AudioStreamFormat(
             samples_per_second=16000, bits_per_sample=16, channels=1
         )
@@ -153,6 +158,7 @@ class AzureLiveTranscriber(AudioProcessorBase):
         )
         self._recognizer.recognizing.connect(self._on_recognizing)
         self._recognizer.recognized.connect(self._on_recognized)
+        self._recognizer.canceled.connect(self._on_canceled)
         self._recognizer.start_continuous_recognition()
 
     def _on_recognizing(self, evt):
@@ -168,13 +174,33 @@ class AzureLiveTranscriber(AudioProcessorBase):
                 self._final.append(evt.result.text)
                 self._partial = ""
 
-    def recv_queued(self, frames):
+    def _on_canceled(self, evt):
+        # Surface Azure-side problems (bad key, etc.) instead of failing silently.
+        if evt.reason == speechsdk.CancellationReason.Error:
+            with self._lock:
+                self.errors.append(str(evt.error_details))
+
+    async def recv_queued(self, frames):
         # Called by streamlit-webrtc with a batch of incoming audio frames.
-        for frame in frames:
-            frame.pts = None  # let the resampler manage timing
-            for resampled in self._resampler.resample(frame):
-                self._push_stream.write(resampled.to_ndarray().tobytes())
+        # MUST be async: the library schedules it with loop.create_task(), which
+        # requires a coroutine. The work inside is fast (resample + push), so
+        # running it inline here is fine.
+        try:
+            for frame in frames:
+                frame.pts = None  # let the resampler manage timing
+                for resampled in self._resampler.resample(frame):
+                    data = resampled.to_ndarray().tobytes()
+                    self._push_stream.write(data)
+                    self.bytes_pushed += len(data)
+            self.frames_in += len(frames)
+        except Exception as err:  # don't let a frame error kill the stream silently
+            with self._lock:
+                self.errors.append(f"frame handling: {err}")
         return frames[-1] if frames else None
+
+    def get_status(self):
+        with self._lock:
+            return self.frames_in, self.bytes_pushed, list(self.errors)
 
     def get_transcript(self) -> str:
         with self._lock:
@@ -195,13 +221,8 @@ class AzureLiveTranscriber(AudioProcessorBase):
 
 
 def render_live_tab():
-    """UI for live transcription from the browser microphone (works anywhere)."""
+    """Live audio: a reliable in-browser recorder, plus experimental real-time."""
     st.subheader("Transcribe live audio")
-    st.write("Click **START**, allow microphone access, and speak. Click **STOP** when done.")
-    st.caption(
-        "Works on any device — your browser captures the microphone and streams "
-        "it for transcription, so it works on phones, tablets, and in the cloud."
-    )
 
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         st.error(
@@ -209,6 +230,55 @@ def render_live_tab():
             "Streamlit secrets (cloud) first."
         )
         return
+
+    rec_tab, rt_tab = st.tabs(["🎙️ Record (recommended)", "⚡ Real-time (beta)"])
+    with rec_tab:
+        render_record_section()
+    with rt_tab:
+        render_realtime_section()
+
+
+def render_record_section():
+    """Record from the browser mic, then transcribe. Works on any device."""
+    st.write(
+        "Tap the microphone to start recording, tap again to stop, then click "
+        "**Transcribe**. Works on phones, tablets, and laptops — including the cloud."
+    )
+    recording = st.audio_input("Record your lecture", key="live_recorder")
+    if recording is None:
+        return
+    if not st.button("Transcribe recording", type="primary", key="live_rec_btn"):
+        return
+    try:
+        with st.spinner("Transcribing…"):
+            transcript = transcribe_uploaded_audio(recording)
+    except RuntimeError as err:
+        st.error(f"Transcription failed: {err}")
+        return
+    if transcript:
+        st.success("Done!")
+        st.text_area("Transcript", transcript, height=300, key="live_rec_text")
+        st.download_button(
+            "⬇️ Download transcript (.txt)",
+            data=transcript,
+            file_name="recording_transcript.txt",
+            mime="text/plain",
+            key="live_rec_dl",
+        )
+    else:
+        st.warning(
+            "No speech was recognized. Try again, speaking a bit louder or "
+            "closer to the microphone."
+        )
+
+
+def render_realtime_section():
+    """Experimental real-time word-by-word transcription via WebRTC."""
+    st.write("Click **START**, allow microphone access, and speak. Words appear as you talk.")
+    st.caption(
+        "Experimental: streams audio from your browser in real time. If it won't "
+        "connect (e.g. on a phone or restrictive network), use the Record tab instead."
+    )
 
     # The webrtc component shows its own START / STOP buttons and handles the
     # browser microphone permission prompt.
@@ -228,22 +298,63 @@ def render_live_tab():
         st.info("🔴 Listening… speak now.")
         if ctx.audio_processor:
             text = ctx.audio_processor.get_transcript()
-            transcript_box.text_area("Live transcript", text, height=300)
+            transcript_box.text_area("Live transcript", text, height=300, key="rt_text")
             # Remember it so it stays visible after you click STOP.
             st.session_state["live_transcript"] = text
+
+            # Diagnostics: shows whether audio is reaching the server / Azure.
+            frames_in, bytes_pushed, errors = ctx.audio_processor.get_status()
+            st.caption(
+                f"🔎 audio frames received: {frames_in} · "
+                f"PCM bytes sent to Azure: {bytes_pushed:,}"
+            )
+            for err in errors:
+                st.error(f"Azure error: {err}")
+        else:
+            st.warning("Connecting… if this persists, the audio stream isn't reaching the server.")
         # Refresh once a second so newly recognized words appear.
         time.sleep(1)
         st.rerun()
     else:
         final = st.session_state.get("live_transcript", "")
-        transcript_box.text_area("Live transcript", final, height=300)
+        transcript_box.text_area("Live transcript", final, height=300, key="rt_text_final")
         if final:
             st.download_button(
                 "⬇️ Download transcript (.txt)",
                 data=final,
                 file_name="live_transcript.txt",
                 mime="text/plain",
+                key="rt_dl",
             )
+
+
+def transcribe_uploaded_audio(uploaded_file) -> str:
+    """Save an uploaded OR recorded audio file, normalize it, and transcribe it.
+
+    Shared by the Upload tab and the Live "Record" tab. Writes the audio to a
+    temp file, converts it to 16 kHz mono WAV with ffmpeg, sends it to Azure
+    Fast Transcription, and always cleans up the temp files.
+    """
+    temp_path = None
+    wav_path = None
+    try:
+        name = getattr(uploaded_file, "name", "") or "audio.wav"
+        suffix = os.path.splitext(name)[1].lower() or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_file.getbuffer())
+            temp_path = tmp.name
+        wav_path = convert_to_wav(temp_path)
+        return transcribe_audio_file(
+            wav_path, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
+        )
+    finally:
+        # Best-effort cleanup; never crash if a handle is briefly still held.
+        for path in {temp_path, wav_path}:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 def render_upload_tab():
@@ -276,56 +387,27 @@ def render_upload_tab():
         st.error("Azure credentials are not set. Configure your .env file first.")
         return
 
-    # WHY THE AUDIO IS SAVED TEMPORARILY:
-    # The upload only exists in memory, but we need a file on disk to normalize
-    # it with ffmpeg. So we write it to a temporary file, process it, and then
-    # delete the temp file(s) afterwards (in the "finally" block).
-    temp_path = None   # the raw uploaded file (could be .wav or .mp3)
-    wav_path = None    # the PCM WAV we actually send to Azure
     try:
-        suffix = os.path.splitext(uploaded_file.name)[1].lower() or ".wav"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_file.getbuffer())
-            temp_path = tmp.name
-
-        # Normalize to 16 kHz mono PCM WAV with ffmpeg. This converts MP3 and
-        # odd WAV formats, and — importantly for long lectures — shrinks the
-        # file (e.g. a stereo 44.1 kHz WAV can be ~1 GB; mono 16 kHz is ~180 MB)
-        # so it stays under Azure's size limit.
-        with st.spinner("Preparing audio…"):
-            wav_path = convert_to_wav(temp_path)
-
         with st.spinner("Transcribing… long lectures process quickly here."):
-            transcript = transcribe_audio_file(
-                wav_path, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
-            )
-
-        if transcript:
-            st.success("Done!")
-            st.text_area("Transcript", transcript, height=300)
-            st.download_button(
-                "⬇️ Download transcript (.txt)",
-                data=transcript,
-                file_name="transcript.txt",
-                mime="text/plain",
-            )
-        else:
-            st.warning(
-                "No speech was recognized. Make sure the file is a clear WAV "
-                "recording (PCM format)."
-            )
+            transcript = transcribe_uploaded_audio(uploaded_file)
     except RuntimeError as err:
         st.error(f"Transcription failed: {err}")
-    finally:
-        # Always clean up the temporary file(s). Deletion is best-effort: if a
-        # file handle is briefly still held, we skip it rather than crash —
-        # the OS clears the temp folder eventually anyway.
-        for path in {temp_path, wav_path}:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+        return
+
+    if transcript:
+        st.success("Done!")
+        st.text_area("Transcript", transcript, height=300, key="upload_text")
+        st.download_button(
+            "⬇️ Download transcript (.txt)",
+            data=transcript,
+            file_name="transcript.txt",
+            mime="text/plain",
+            key="upload_dl",
+        )
+    else:
+        st.warning(
+            "No speech was recognized. Make sure the file is a clear recording."
+        )
 
 
 def main():
