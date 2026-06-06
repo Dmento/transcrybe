@@ -98,13 +98,19 @@ This is the easiest way to get a public URL anyone can open on any device.
    `packages.txt` (system libraries) for you, then launches the app at a public
    `https://<your-app>.streamlit.app` URL.
 
-> **Live mic on a deployed app:** browsers stream audio over WebRTC, which
-> usually connects via the public STUN server already configured in `app.py`.
-> On some restrictive networks (e.g. certain mobile/corporate firewalls) a STUN
-> server isn't enough and a **TURN** server is required. If live mode connects
-> but produces no audio on such a network, add a TURN server (e.g. a free/cheap
-> provider like Twilio or `metered.ca`) to the `rtc_configuration` in `app.py`.
-> File upload is unaffected and always works.
+> **Live mic on phones (iPhone/cellular) needs TURN:** the real-time tab streams
+> audio over WebRTC. On mobile/restrictive networks, STUN alone can't connect —
+> you must add a **TURN** server. Get free TURN credentials (e.g.
+> [metered.ca](https://www.metered.ca/tools/openrelay/), 50 GB/mo free), then add
+> a `TURN_CONFIG` secret (a JSON list of ICE servers):
+>
+> ```toml
+> TURN_CONFIG = '[{"urls":["turn:HOST:443?transport=tcp","turn:HOST:80"],"username":"USER","credential":"PASS"}]'
+> ```
+>
+> The app reads it via `build_rtc_configuration()` and merges it with STUN — no
+> credentials in code. Without TURN, real-time still works on desktop/same
+> network, and the **Record** tab + file upload work everywhere.
 
 > **If the cloud build fails** on a missing system library, read the build log
 > and add the named package to `packages.txt`, then push again.

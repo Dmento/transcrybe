@@ -44,6 +44,29 @@ def get_credential(name: str):
     return os.getenv(name)
 
 
+def build_rtc_configuration():
+    """ICE servers for the real-time (WebRTC) live transcription.
+
+    Always includes a public STUN server. On mobile / restrictive networks
+    (e.g. an iPhone on cellular), STUN alone usually can't connect — a TURN
+    relay is required. If a TURN_CONFIG secret is provided (a JSON list of ICE
+    server entries), we add it. Keeping it in secrets means no credentials in
+    the code, and local dev still works with STUN only.
+    """
+    ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    turn = get_credential("TURN_CONFIG")
+    if turn:
+        try:
+            extra = json.loads(turn) if isinstance(turn, str) else turn
+            if isinstance(extra, dict):
+                extra = [extra]
+            ice_servers.extend(extra)
+        except Exception:
+            # Bad/missing TURN config shouldn't break the app — STUN still set.
+            pass
+    return {"iceServers": ice_servers}
+
+
 # load_dotenv() reads a local ".env" file into the environment for local runs.
 # The secret key is NEVER written in this code — it only lives in .env locally
 # or in the Streamlit Cloud secrets dashboard when deployed.
@@ -289,8 +312,8 @@ def render_realtime_section():
         mode=WebRtcMode.SENDONLY,
         audio_processor_factory=AzureLiveTranscriber,
         media_stream_constraints={"audio": True, "video": False},
-        # Public STUN server helps browsers connect through firewalls/NAT.
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        # STUN + optional TURN (from secrets). TURN is needed for iPhone/mobile.
+        rtc_configuration=build_rtc_configuration(),
         async_processing=True,
     )
 
