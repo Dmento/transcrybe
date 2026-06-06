@@ -1,0 +1,29 @@
+# Secrets — never commit your real keys
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Uploaded / temporary audio files
+*.wav
+*.mp3
+*.m4a
+uploads/
+temp/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json

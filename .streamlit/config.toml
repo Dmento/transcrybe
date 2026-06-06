@@ -1,0 +1,3 @@
+[server]
+# Maximum size (in MB) for a single uploaded file. Streamlit's default is 200.
+maxUploadSize = 600

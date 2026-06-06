@@ -1,0 +1,7 @@
+streamlit
+streamlit-webrtc
+azure-cognitiveservices-speech
+python-dotenv
+imageio-ffmpeg
+requests
+av
