@@ -44,16 +44,57 @@ def get_credential(name: str):
     return os.getenv(name)
 
 
+def _cloudflare_ice_servers():
+    """Mint short-lived TURN credentials from Cloudflare, if configured.
+
+    Cloudflare's TURN service hands out ephemeral credentials rather than a
+    static username/password, so we ask its API for a fresh set on each render.
+    Set two secrets to enable it:
+      - CLOUDFLARE_TURN_KEY_ID
+      - CLOUDFLARE_TURN_API_TOKEN
+    Returns Cloudflare's ready-made iceServers list (STUN + TURN), or None when
+    not configured or the request fails (so STUN-only still works locally).
+    """
+    key_id = get_credential("CLOUDFLARE_TURN_KEY_ID")
+    api_token = get_credential("CLOUDFLARE_TURN_API_TOKEN")
+    if not key_id or not api_token:
+        return None
+    try:
+        resp = requests.post(
+            f"https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}"
+            "/credentials/generate-ice-servers",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json",
+            },
+            json={"ttl": 86400},  # 24h — comfortably longer than any session
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("iceServers")
+    except Exception:
+        # Never let a TURN hiccup break page render — STUN is still set.
+        return None
+
+
 def build_rtc_configuration():
     """ICE servers for the real-time (WebRTC) live transcription.
 
-    Always includes a public STUN server. On mobile / restrictive networks
-    (e.g. an iPhone on cellular), STUN alone usually can't connect — a TURN
-    relay is required. If a TURN_CONFIG secret is provided (a JSON list of ICE
-    server entries), we add it. Keeping it in secrets means no credentials in
-    the code, and local dev still works with STUN only.
+    Always includes a public STUN server. On cloud hosting (Streamlit Cloud) or
+    mobile / restrictive networks (e.g. an iPhone on cellular), STUN alone can't
+    connect — a TURN relay is required. We support two ways to supply one:
+      - Cloudflare TURN, via CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_API_TOKEN
+        secrets (preferred; credentials are minted fresh per render), or
+      - a static TURN_CONFIG secret (a JSON list of ICE server entries).
+    Keeping these in secrets means no credentials in the code, and local dev
+    still works with STUN only.
     """
     ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+    cf_ice = _cloudflare_ice_servers()
+    if cf_ice:
+        ice_servers.extend(cf_ice)
+
     turn = get_credential("TURN_CONFIG")
     if turn:
         try:
