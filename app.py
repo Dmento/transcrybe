@@ -346,6 +346,27 @@ def render_realtime_section():
         "connect (e.g. on a phone or restrictive network), use the Record tab instead."
     )
 
+    # Build the ICE config once so we can both use it and report on it. On
+    # Streamlit Cloud a TURN relay is mandatory; if none made it into the config
+    # (e.g. the Cloudflare secrets aren't wired up), say so up front instead of
+    # letting it silently fail to connect.
+    rtc_config = build_rtc_configuration()
+    turn_urls = [
+        u
+        for server in rtc_config["iceServers"]
+        for u in ([server["urls"]] if isinstance(server.get("urls"), str)
+                  else server.get("urls", []))
+        if str(u).startswith(("turn:", "turns:"))
+    ]
+    if turn_urls:
+        st.caption(f"TURN relay configured ✓ ({len(turn_urls)} relay URLs).")
+    else:
+        st.warning(
+            "No TURN relay is configured — on Streamlit Cloud the connection "
+            "can't form without one. Set the CLOUDFLARE_TURN_KEY_ID and "
+            "CLOUDFLARE_TURN_API_TOKEN secrets (exact names)."
+        )
+
     # The webrtc component shows its own START / STOP buttons and handles the
     # browser microphone permission prompt.
     ctx = webrtc_streamer(
@@ -353,8 +374,9 @@ def render_realtime_section():
         mode=WebRtcMode.SENDONLY,
         audio_processor_factory=AzureLiveTranscriber,
         media_stream_constraints={"audio": True, "video": False},
-        # STUN + optional TURN (from secrets). TURN is needed for iPhone/mobile.
-        rtc_configuration=build_rtc_configuration(),
+        # STUN + TURN (from secrets). rtc_configuration is a shorthand that
+        # configures BOTH the browser and the server-side peer.
+        rtc_configuration=rtc_config,
         async_processing=True,
     )
 
@@ -382,10 +404,11 @@ def render_realtime_section():
                 f"Audio in: {frames_in} frames · {bytes_pushed:,} bytes sent to Azure"
             )
             if frames_in == 0:
-                st.warning(
-                    "No audio is reaching the server yet. On Streamlit Cloud / "
-                    "mobile networks this usually means a TURN relay is required "
-                    "for media — set the TURN_CONFIG secret."
+                st.info(
+                    "Waiting for audio… the first few seconds after START are "
+                    "normal while the connection negotiates. If frames stay at 0 "
+                    "after ~10s of speaking, the media relay isn't working — check "
+                    "that the TURN relay shows configured above."
                 )
             for err in errors:
                 st.error(f"Azure error: {err}")
