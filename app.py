@@ -332,7 +332,21 @@ def render_realtime_section():
             # Remember it so it stays visible after you click STOP.
             st.session_state["live_transcript"] = text
 
-            for err in ctx.audio_processor.get_status()[2]:
+            # Diagnostics: shows exactly where the pipeline breaks when no words
+            # appear. frames_in=0 means the browser audio isn't reaching the
+            # server (usually a TURN/media relay problem on restrictive
+            # networks); bytes_pushed>0 with no transcript points at Azure.
+            frames_in, bytes_pushed, errors = ctx.audio_processor.get_status()
+            st.caption(
+                f"Audio in: {frames_in} frames · {bytes_pushed:,} bytes sent to Azure"
+            )
+            if frames_in == 0:
+                st.warning(
+                    "No audio is reaching the server yet. On Streamlit Cloud / "
+                    "mobile networks this usually means a TURN relay is required "
+                    "for media — set the TURN_CONFIG secret."
+                )
+            for err in errors:
                 st.error(f"Azure error: {err}")
         else:
             st.warning("Connecting… if this persists, the audio stream isn't reaching the server.")
