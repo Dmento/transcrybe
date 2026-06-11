@@ -9,6 +9,7 @@ streamlit-webrtc==0.72.1
 # av must stay <17: streamlit-webrtc 0.72.1 -> aiortc 1.14.0 requires av<17.
 av==16.1.0
 azure-cognitiveservices-speech
+azure-storage-blob
 python-dotenv
 imageio-ffmpeg
 requests

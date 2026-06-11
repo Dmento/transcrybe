@@ -22,6 +22,8 @@ import imageio_ffmpeg
 from dotenv import load_dotenv
 from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
 
+import storage  # Course/Module/Title persistence (Azure Blob); UI-free helpers.
+
 # Azure Fast Transcription REST API version (GA).
 FAST_TRANSCRIPTION_API_VERSION = "2024-11-15"
 
@@ -313,6 +315,8 @@ def render_record_section():
     recording = st.audio_input("Record your lecture", key="live_recorder")
     if recording is None:
         return
+    # Ask where to save BEFORE transcribing (no-op if storage isn't configured).
+    dest = pick_destination("rec")
     if not st.button("Transcribe recording", type="primary", key="live_rec_btn"):
         return
     try:
@@ -324,6 +328,7 @@ def render_record_section():
     if transcript:
         st.success("Done!")
         st.text_area("Transcript", transcript, height=300, key="live_rec_text")
+        save_to_library(dest, transcript, recording, "recording.wav")
         st.download_button(
             "⬇️ Download transcript (.txt)",
             data=transcript,
@@ -461,6 +466,146 @@ def transcribe_uploaded_audio(uploaded_file) -> str:
                     pass
 
 
+# Sentinel shown in each layer's dropdown to start creating a new folder.
+_NEW_FOLDER = "➕ Create new…"
+
+
+def _layer_picker(label: str, existing, key: str):
+    """One layer of the destination picker: choose an existing folder OR type a
+    new name. Returns the chosen/typed name, or None if nothing is set yet."""
+    choice = st.selectbox(label, existing + [_NEW_FOLDER], key=f"{key}_sel")
+    if choice == _NEW_FOLDER:
+        typed = st.text_input(f"New {label.lower()} name", key=f"{key}_new")
+        return typed.strip() or None
+    return choice
+
+
+def pick_destination(key_prefix: str):
+    """Ask where to save: Course -> Module -> Title, each with inline create.
+
+    Shown BEFORE transcribing so the user chooses a destination up front.
+    Returns a (course, module, title) tuple once all three are set, otherwise
+    None (including when storage isn't configured, so callers can skip saving).
+    """
+    if not storage.storage_available():
+        st.caption(
+            "💾 Saving is off — add an AZURE_STORAGE_CONNECTION_STRING secret to "
+            "store this in your Course / Module / Title library."
+        )
+        return None
+
+    st.markdown("**Where should this be saved?**")
+    course = _layer_picker("Course", storage.list_courses(), f"{key_prefix}_c")
+    if not course:
+        return None
+    module = _layer_picker("Module", storage.list_modules(course), f"{key_prefix}_m")
+    if not module:
+        return None
+    title = _layer_picker("Title", storage.list_titles(course, module), f"{key_prefix}_t")
+    if not title:
+        return None
+    return course, module, title
+
+
+def _audio_bytes_and_name(audio_file, fallback_name: str):
+    """Pull raw bytes + a filename out of an uploaded/recorded audio object."""
+    if hasattr(audio_file, "getvalue"):
+        data = audio_file.getvalue()
+    else:
+        audio_file.seek(0)
+        data = audio_file.read()
+    name = getattr(audio_file, "name", "") or fallback_name
+    return data, name
+
+
+def save_to_library(dest, transcript: str, audio_file, audio_fallback_name: str):
+    """Persist the transcript and its audio into the chosen Course/Module/Title.
+
+    `dest` is the (course, module, title) tuple from pick_destination, or None
+    (saving disabled / not chosen) in which case this is a no-op.
+    """
+    if not dest:
+        return
+    course, module, title = dest
+    try:
+        storage.save_transcript(course, module, title, transcript)
+        if audio_file is not None:
+            data, name = _audio_bytes_and_name(audio_file, audio_fallback_name)
+            storage.save_bytes(
+                course, module, title, name, data,
+                getattr(audio_file, "type", None),
+            )
+        st.success(f"💾 Saved to {course} / {module} / {title}")
+    except Exception as err:
+        st.error(f"Couldn't save to library: {err}")
+
+
+def render_library_tab():
+    """Browse the Course/Module/Title tree and download saved files."""
+    st.subheader("📚 Library")
+    if not storage.storage_available():
+        st.info(
+            "The library isn't enabled. Add an AZURE_STORAGE_CONNECTION_STRING "
+            "secret (Azure Storage account → Access keys → Connection string) to "
+            "save and browse transcripts and audio here."
+        )
+        return
+
+    # Create folders ahead of time, at any layer.
+    with st.expander("➕ Create a folder"):
+        new_course = st.text_input("Course", key="lib_new_course")
+        new_module = st.text_input("Module (optional)", key="lib_new_module")
+        new_title = st.text_input("Title (optional)", key="lib_new_title")
+        if st.button("Create folder", key="lib_create_btn"):
+            if not new_course.strip():
+                st.warning("A course name is required.")
+            else:
+                try:
+                    storage.create_folder(
+                        new_course, new_module or None, new_title or None
+                    )
+                    st.success("Folder created.")
+                    st.rerun()
+                except Exception as err:
+                    st.error(f"Couldn't create folder: {err}")
+
+    courses = storage.list_courses()
+    if not courses:
+        st.write("Nothing saved yet. Record or upload a lecture, choose a "
+                 "destination, and it'll appear here.")
+        return
+
+    course = st.selectbox("Course", courses, key="lib_course")
+    modules = storage.list_modules(course)
+    if not modules:
+        st.write("_(no modules in this course yet)_")
+        return
+    module = st.selectbox("Module", modules, key="lib_module")
+    titles = storage.list_titles(course, module)
+    if not titles:
+        st.write("_(no titles in this module yet)_")
+        return
+    title = st.selectbox("Title", titles, key="lib_title")
+
+    files = storage.list_files(course, module, title)
+    if not files:
+        st.write("_(this title has no files yet)_")
+        return
+    st.write(f"**Files in {course} / {module} / {title}:**")
+    for fname, size, blob_name in files:
+        data = storage.read_blob(blob_name)
+        if fname == "transcript.txt":
+            with st.expander("📄 transcript.txt"):
+                st.text_area(
+                    "Transcript", data.decode("utf-8", "replace"),
+                    height=200, key=f"lib_txt_{blob_name}",
+                )
+        st.download_button(
+            f"⬇️ {fname} ({size:,} bytes)",
+            data=data, file_name=fname, key=f"lib_dl_{blob_name}",
+        )
+
+
 def render_upload_tab():
     """UI for uploading a pre-recorded lecture and transcribing it."""
     st.subheader("Upload a pre-recorded lecture")
@@ -484,6 +629,9 @@ def render_upload_tab():
     # Let the user listen back to confirm they picked the right file.
     st.audio(uploaded_file)
 
+    # Ask where to save BEFORE transcribing (no-op if storage isn't configured).
+    dest = pick_destination("upload")
+
     if not st.button("Transcribe", type="primary"):
         return
 
@@ -501,6 +649,7 @@ def render_upload_tab():
     if transcript:
         st.success("Done!")
         st.text_area("Transcript", transcript, height=300, key="upload_text")
+        save_to_library(dest, transcript, uploaded_file, "audio.wav")
         st.download_button(
             "⬇️ Download transcript (.txt)",
             data=transcript,
@@ -529,13 +678,18 @@ def main():
     else:
         st.success(f"Azure Speech configured (region: {AZURE_SPEECH_REGION})")
 
-    tab_upload, tab_live = st.tabs(["📁 Upload audio", "🎤 Live audio"])
+    tab_upload, tab_live, tab_library = st.tabs(
+        ["📁 Upload audio", "🎤 Live audio", "📚 Library"]
+    )
 
     with tab_upload:
         render_upload_tab()
 
     with tab_live:
         render_live_tab()
+
+    with tab_library:
+        render_library_tab()
 
 
 if __name__ == "__main__":
