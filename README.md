@@ -185,12 +185,12 @@ Transcrybe/
 
 ## Upload size limit
 
-Streamlit's default maximum upload is 200 MB. This app raises it to **600 MB**
-via `.streamlit/config.toml`:
+Streamlit's default maximum upload is 200 MB. This app raises it to **2048 MB**
+(2 GB) via `.streamlit/config.toml`:
 
 ```toml
 [server]
-maxUploadSize = 600
+maxUploadSize = 2048
 ```
 
 This setting is picked up automatically both locally and on Azure App Service,
