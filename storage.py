@@ -22,7 +22,14 @@ import mimetypes
 import os
 
 import streamlit as st
-from azure.storage.blob import ContainerClient, ContentSettings
+
+try:
+    from azure.storage.blob import ContainerClient, ContentSettings
+    _BLOB_IMPORT_ERROR = None
+except Exception as err:  # pragma: no cover - cloud-only dependency issue
+    ContainerClient = None
+    ContentSettings = None
+    _BLOB_IMPORT_ERROR = err
 
 # A single container holds the whole Course/Module/Title tree.
 CONTAINER_NAME = "transcripts"
@@ -46,7 +53,7 @@ def _get_credential(name: str):
 
 def storage_available() -> bool:
     """True if a storage connection string is configured."""
-    return bool(_get_credential("AZURE_STORAGE_CONNECTION_STRING"))
+    return bool(_get_credential("AZURE_STORAGE_CONNECTION_STRING")) and ContainerClient is not None
 
 
 @st.cache_resource(show_spinner=False)
@@ -56,6 +63,10 @@ def _get_container(conn_str: str) -> ContainerClient:
     Cached per connection string so we don't recreate the client (or re-check
     the container) on every Streamlit rerun.
     """
+    if ContainerClient is None:
+        raise RuntimeError(
+            f"Azure Blob Storage could not be imported: {_BLOB_IMPORT_ERROR}"
+        )
     client = ContainerClient.from_connection_string(conn_str, CONTAINER_NAME)
     try:
         client.create_container()
@@ -69,6 +80,8 @@ def _container():
     """The active ContainerClient, or None when storage isn't configured."""
     conn = _get_credential("AZURE_STORAGE_CONNECTION_STRING")
     if not conn:
+        return None
+    if ContainerClient is None:
         return None
     return _get_container(conn)
 
@@ -137,6 +150,10 @@ def save_bytes(course: str, module: str, title: str, filename: str,
     """Store a file inside a Course/Module/Title folder. Returns the blob name."""
     container = _container()
     if container is None:
+        if _BLOB_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                f"Azure Blob Storage could not be imported: {_BLOB_IMPORT_ERROR}"
+            )
         raise RuntimeError("Storage is not configured.")
     if content_type is None:
         content_type = mimetypes.guess_type(filename)[0]

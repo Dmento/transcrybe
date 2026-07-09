@@ -14,13 +14,38 @@ import tempfile
 import threading
 import time
 
-import av
 import requests
 import streamlit as st
-import azure.cognitiveservices.speech as speechsdk
 import imageio_ffmpeg
 from dotenv import load_dotenv
-from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
+
+try:
+    import av
+    _AV_IMPORT_ERROR = None
+except Exception as err:  # pragma: no cover - cloud-only dependency issue
+    av = None
+    _AV_IMPORT_ERROR = err
+
+try:
+    import azure.cognitiveservices.speech as speechsdk
+    _SPEECH_IMPORT_ERROR = None
+except Exception as err:  # pragma: no cover - cloud-only dependency issue
+    speechsdk = None
+    _SPEECH_IMPORT_ERROR = err
+
+try:
+    from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
+    _WEBRTC_IMPORT_ERROR = None
+except Exception as err:  # pragma: no cover - cloud-only dependency issue
+    _WEBRTC_IMPORT_ERROR = err
+
+    class AudioProcessorBase:
+        pass
+
+    WebRtcMode = None
+
+    def webrtc_streamer(*args, _err=err, **kwargs):
+        raise RuntimeError(f"streamlit-webrtc is unavailable: {_err}")
 
 import storage  # Course/Module/Title persistence (Azure Blob); UI-free helpers.
 
@@ -110,6 +135,17 @@ def build_rtc_configuration():
     return {"iceServers": ice_servers}
 
 
+def _dependency_messages():
+    messages = []
+    if _AV_IMPORT_ERROR is not None:
+        messages.append(f"PyAV import failed: {_AV_IMPORT_ERROR}")
+    if _SPEECH_IMPORT_ERROR is not None:
+        messages.append(f"Azure Speech import failed: {_SPEECH_IMPORT_ERROR}")
+    if _WEBRTC_IMPORT_ERROR is not None:
+        messages.append(f"streamlit-webrtc import failed: {_WEBRTC_IMPORT_ERROR}")
+    return messages
+
+
 # load_dotenv() reads a local ".env" file into the environment for local runs.
 # The secret key is NEVER written in this code — it only lives in .env locally
 # or in the Streamlit Cloud secrets dashboard when deployed.
@@ -197,6 +233,11 @@ class AzureLiveTranscriber(AudioProcessorBase):
     """
 
     def __init__(self):
+        if speechsdk is None or av is None:
+            raise RuntimeError(
+                "Live transcription dependencies are unavailable: "
+                + "; ".join(_dependency_messages())
+            )
         self._lock = threading.Lock()
         self._final = []     # finalized sentences
         self._partial = ""   # the phrase currently being recognized
@@ -334,6 +375,15 @@ class AzureLiveTranscriber(AudioProcessorBase):
 def render_live_tab():
     """Live audio: a reliable in-browser recorder, plus experimental real-time."""
     st.subheader("Transcribe live audio")
+
+    dependency_messages = _dependency_messages()
+    if dependency_messages:
+        st.error(
+            "Live transcription dependencies failed to load on this server: "
+            + " | ".join(dependency_messages)
+        )
+        st.info("The Upload tab can still work if Azure Speech is configured.")
+        return
 
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         st.error(
@@ -707,6 +757,13 @@ def render_upload_tab():
     dest = pick_destination("upload")
 
     if not st.button("Transcribe", type="primary"):
+        return
+
+    if speechsdk is None:
+        st.error(
+            "Azure Speech could not be imported on this server: "
+            f"{_SPEECH_IMPORT_ERROR}"
+        )
         return
 
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
