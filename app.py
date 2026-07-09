@@ -209,6 +209,13 @@ class AzureLiveTranscriber(AudioProcessorBase):
         self.bytes_pushed = 0  # PCM bytes sent to Azure
         self.errors = []       # any errors from Azure or frame handling
 
+        # Lifecycle: continuous recognition can stop on its own after a silence
+        # or a transient error. We auto-restart it (see _on_session_stopped) so
+        # a pause doesn't permanently kill live transcription. `_stopping` tells
+        # the restart logic to stand down once we're intentionally shutting down.
+        self._stopping = False
+        self._bytes_at_last_start = 0
+
         audio_format = speechsdk.audio.AudioStreamFormat(
             samples_per_second=16000, bits_per_sample=16, channels=1
         )
@@ -225,6 +232,7 @@ class AzureLiveTranscriber(AudioProcessorBase):
         self._recognizer.recognizing.connect(self._on_recognizing)
         self._recognizer.recognized.connect(self._on_recognized)
         self._recognizer.canceled.connect(self._on_canceled)
+        self._recognizer.session_stopped.connect(self._on_session_stopped)
         self._recognizer.start_continuous_recognition()
 
     def _on_recognizing(self, evt):
@@ -245,6 +253,29 @@ class AzureLiveTranscriber(AudioProcessorBase):
         if evt.reason == speechsdk.CancellationReason.Error:
             with self._lock:
                 self.errors.append(str(evt.error_details))
+
+    def _on_session_stopped(self, evt):
+        # Azure ended this recognition session — typically after a long silence,
+        # an end-of-stream, or a transient error. Restart it so audio that
+        # resumes after a pause is still transcribed, instead of going dead.
+        #
+        # Guard against tight restart loops: only restart if audio actually
+        # flowed since the last start. A session that stops having pushed no new
+        # bytes (e.g. a bad key that fails immediately) would otherwise respawn
+        # forever; this lets it stop instead.
+        with self._lock:
+            if self._stopping:
+                return
+            made_progress = self.bytes_pushed > self._bytes_at_last_start
+            self._bytes_at_last_start = self.bytes_pushed
+            self._partial = ""
+        if not made_progress:
+            return
+        try:
+            self._recognizer.start_continuous_recognition_async()
+        except Exception as err:
+            with self._lock:
+                self.errors.append(f"recognition restart: {err}")
 
     async def recv_queued(self, frames):
         # Called by streamlit-webrtc with a batch of incoming audio frames.
@@ -277,7 +308,19 @@ class AzureLiveTranscriber(AudioProcessorBase):
                 text = (text + " " + self._partial).strip()
             return text
 
+    def get_segments(self):
+        """Return (finalized_segments_copy, current_partial).
+
+        The caller accumulates finalized segments into Streamlit session state
+        so the transcript survives this processor being torn down and rebuilt
+        on a reconnect (which is what used to wipe everything on a pause).
+        """
+        with self._lock:
+            return list(self._final), self._partial
+
     def stop(self):
+        with self._lock:
+            self._stopping = True  # tell _on_session_stopped not to restart
         try:
             self._recognizer.stop_continuous_recognition()
             self._push_stream.close()
@@ -390,15 +433,39 @@ def render_realtime_section():
     if ctx.state.playing:
         st.info("🔴 Listening… speak now.")
         if ctx.audio_processor:
-            text = ctx.audio_processor.get_transcript()
+            # Accumulate finalized speech into session state so it OUTLIVES the
+            # audio processor. On a pause, a flaky network can drop the WebRTC
+            # connection; streamlit-webrtc then builds a fresh processor with an
+            # empty transcript. We therefore never read the whole transcript off
+            # the (possibly brand-new) processor — we append only its NOT-yet-
+            # consumed finalized segments to what we've already banked.
+            finals, partial = ctx.audio_processor.get_segments()
+
+            # A new processor object means a (re)connection happened: reset how
+            # many of its segments we've consumed, but KEEP the banked text.
+            proc_id = id(ctx.audio_processor)
+            if st.session_state.get("rt_proc_id") != proc_id:
+                st.session_state["rt_proc_id"] = proc_id
+                st.session_state["rt_consumed"] = 0
+
+            consumed = st.session_state.get("rt_consumed", 0)
+            new_segments = finals[consumed:]
+            if new_segments:
+                banked = st.session_state.get("live_transcript", "")
+                banked = (banked + " " + " ".join(new_segments)).strip()
+                st.session_state["live_transcript"] = banked
+                st.session_state["rt_consumed"] = len(finals)
+
+            # Show banked text plus the live partial (partial is never banked —
+            # it gets replaced by a finalized segment once Azure commits it).
+            banked = st.session_state.get("live_transcript", "")
+            text = (banked + " " + partial).strip() if partial else banked
             # Use markdown (not a keyed text_area): a widget with a key ignores
             # its `value` after first render, so a live-updating text_area would
             # stay frozen on its initial (empty) value.
             transcript_box.markdown(
                 f"**Live transcript:**\n\n{text if text else '_(listening…)_'}"
             )
-            # Remember it so it stays visible after you click STOP.
-            st.session_state["live_transcript"] = text
 
             # Diagnostics: shows exactly where the pipeline breaks when no words
             # appear. frames_in=0 means the browser audio isn't reaching the
@@ -435,6 +502,13 @@ def render_realtime_section():
                 mime="text/plain",
                 key="rt_dl",
             )
+            # The transcript is kept across reconnects, so it also persists after
+            # you STOP. Clear it before starting a genuinely new recording so the
+            # next session doesn't append onto this one.
+            if st.button("🗑️ Clear transcript", key="rt_clear"):
+                for k in ("live_transcript", "rt_consumed", "rt_proc_id"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
 
 def transcribe_uploaded_audio(uploaded_file) -> str:
