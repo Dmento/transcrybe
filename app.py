@@ -16,7 +16,12 @@ import time
 
 import requests
 import streamlit as st
-import imageio_ffmpeg
+try:
+    import imageio_ffmpeg
+    _IMAGEIO_FFMPEG_ERROR = None
+except Exception as err:  # pragma: no cover - optional system dependency
+    imageio_ffmpeg = None
+    _IMAGEIO_FFMPEG_ERROR = err
 from dotenv import load_dotenv
 
 try:
@@ -143,6 +148,8 @@ def _dependency_messages():
         messages.append(f"Azure Speech import failed: {_SPEECH_IMPORT_ERROR}")
     if _WEBRTC_IMPORT_ERROR is not None:
         messages.append(f"streamlit-webrtc import failed: {_WEBRTC_IMPORT_ERROR}")
+    if globals().get("_IMAGEIO_FFMPEG_ERROR") is not None:
+        messages.append(f"imageio-ffmpeg import failed: {_IMAGEIO_FFMPEG_ERROR}")
     return messages
 
 
