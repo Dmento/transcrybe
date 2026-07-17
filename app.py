@@ -53,6 +53,12 @@ except Exception as err:  # pragma: no cover - cloud-only dependency issue
         raise RuntimeError(f"streamlit-webrtc is unavailable: {_err}")
 
 import storage  # Course/Module/Title persistence (Azure Blob); UI-free helpers.
+from audio_utils import (
+    get_supported_audio_extensions,
+    is_supported_audio_file,
+    prepare_audio_for_transcription,
+    should_convert_to_wav,
+)
 from freeconvert_utils import convert_audio_with_freeconvert
 from transcript_utils import build_transcript_insights
 
@@ -164,24 +170,12 @@ AZURE_SPEECH_REGION = get_credential("AZURE_SPEECH_REGION")
 
 
 def convert_to_wav(input_path: str) -> str:
-    """Convert an audio file (e.g. MP3) into a 16 kHz mono PCM WAV file.
+    """Prepare an audio file for Azure transcription.
 
-    Azure's file input only understands PCM WAV, so for other formats like MP3
-    we first convert. We use a bundled ffmpeg that comes with the
-    imageio-ffmpeg pip package, so you don't have to install ffmpeg yourself.
-    Returns the path to the new WAV file.
+    WAV files are reused directly to avoid an unnecessary ffmpeg pass.
+    Other formats are converted to 16 kHz mono WAV once so Azure can consume them.
     """
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    wav_path = input_path + ".converted.wav"
-    result = subprocess.run(
-        [ffmpeg_exe, "-y", "-i", input_path,
-         "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        # Show the tail of ffmpeg's error so problems are easy to diagnose.
-        raise RuntimeError(f"Could not convert audio to WAV: {result.stderr[-300:]}")
-    return wav_path
+    return prepare_audio_for_transcription(input_path)
 
 
 def transcribe_audio_file(file_path: str, key: str, region: str,
@@ -601,9 +595,13 @@ def transcribe_uploaded_audio(uploaded_file) -> str:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded_file.getbuffer())
             temp_path = tmp.name
-        wav_path = convert_to_wav(temp_path)
+        if should_convert_to_wav(name):
+            wav_path = convert_to_wav(temp_path)
+            audio_path = wav_path
+        else:
+            audio_path = temp_path
         return transcribe_audio_file(
-            wav_path, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
+            audio_path, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
         )
     finally:
         # Best-effort cleanup; never crash if a handle is briefly still held.
@@ -778,10 +776,21 @@ def render_upload_tab():
         key="freeconvert_target_format",
     )
 
+    supported_exts = ", ".join(get_supported_audio_extensions())
+    st.caption(f"Drag and drop an audio file here or use the picker below. Supported types: {supported_exts}")
+
     # WHAT THE UPLOADED FILE DOES:
     # The file uploader lets you pick an audio file from your computer. The
     # file is held in memory by Streamlit until we save it for Azure to read.
-    uploaded_file = st.file_uploader("Choose a WAV or MP3 file", type=["wav", "mp3"])
+    uploaded_file = st.file_uploader(
+        "Choose an audio file",
+        type=get_supported_audio_extensions(),
+        accept_multiple_files=False,
+    )
+
+    if uploaded_file is not None and not is_supported_audio_file(getattr(uploaded_file, "name", "")):
+        st.warning("Unsupported file type. Please choose one of the supported audio formats.")
+        return
 
     if uploaded_file is None:
         return
