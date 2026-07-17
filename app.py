@@ -53,6 +53,8 @@ except Exception as err:  # pragma: no cover - cloud-only dependency issue
         raise RuntimeError(f"streamlit-webrtc is unavailable: {_err}")
 
 import storage  # Course/Module/Title persistence (Azure Blob); UI-free helpers.
+from freeconvert_utils import convert_audio_with_freeconvert
+from transcript_utils import build_transcript_insights
 
 # Azure Fast Transcription REST API version (GA).
 FAST_TRANSCRIPTION_API_VERSION = "2024-11-15"
@@ -379,6 +381,21 @@ class AzureLiveTranscriber(AudioProcessorBase):
         self.stop()
 
 
+def render_transcript_insights(transcript: str):
+    """Show lightweight transcript insights under the transcript output."""
+    if not transcript:
+        return
+    insights = build_transcript_insights(transcript)
+    with st.expander("🧠 Transcript insights", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Words", insights["word_count"])
+        col2.metric("Estimated length", f"{insights['estimated_duration_minutes']} min")
+        col3.metric("Keywords", ", ".join(insights["keywords"]) or "—")
+        if insights["preview"]:
+            st.caption("Preview")
+            st.write(insights["preview"])
+
+
 def render_live_tab():
     """Live audio: a reliable in-browser recorder, plus experimental real-time."""
     st.subheader("Transcribe live audio")
@@ -428,6 +445,7 @@ def render_record_section():
     if transcript:
         st.success("Done!")
         st.text_area("Transcript", transcript, height=300, key="live_rec_text")
+        render_transcript_insights(transcript)
         save_to_library(dest, transcript, recording, "recording.wav")
         st.download_button(
             "⬇️ Download transcript (.txt)",
@@ -727,10 +745,12 @@ def render_library_tab():
         data = storage.read_blob(blob_name)
         if fname == "transcript.txt":
             with st.expander("📄 transcript.txt"):
+                transcript_text = data.decode("utf-8", "replace")
                 st.text_area(
-                    "Transcript", data.decode("utf-8", "replace"),
+                    "Transcript", transcript_text,
                     height=200, key=f"lib_txt_{blob_name}",
                 )
+                render_transcript_insights(transcript_text)
         st.download_button(
             f"⬇️ {fname} ({size:,} bytes)",
             data=data, file_name=fname, key=f"lib_dl_{blob_name}",
@@ -749,6 +769,15 @@ def render_upload_tab():
         "various WAV formats are converted automatically before transcribing."
     )
 
+    st.subheader("🎛️ Convert audio format")
+    st.write("Optionally convert the uploaded audio to another format using FreeConvert.")
+    target_format = st.selectbox(
+        "Target format",
+        ["mp3", "wav", "ogg", "m4a", "flac"],
+        index=0,
+        key="freeconvert_target_format",
+    )
+
     # WHAT THE UPLOADED FILE DOES:
     # The file uploader lets you pick an audio file from your computer. The
     # file is held in memory by Streamlit until we save it for Azure to read.
@@ -762,6 +791,24 @@ def render_upload_tab():
 
     # Ask where to save BEFORE transcribing (no-op if storage isn't configured).
     dest = pick_destination("upload")
+
+    if st.button("Convert audio", type="secondary"):
+        access_token = get_credential("FREECONVERT_ACCESS_TOKEN")
+        if not access_token:
+            st.error("Add a FREECONVERT_ACCESS_TOKEN secret to use FreeConvert conversion.")
+        else:
+            try:
+                with st.spinner("Converting audio…"):
+                    result = convert_audio_with_freeconvert(
+                        uploaded_file.getvalue(),
+                        uploaded_file.name,
+                        target_format,
+                        access_token,
+                    )
+                st.success("Conversion request submitted to FreeConvert.")
+                st.json(result)
+            except RuntimeError as err:
+                st.error(f"Conversion failed: {err}")
 
     if not st.button("Transcribe", type="primary"):
         return
@@ -787,6 +834,7 @@ def render_upload_tab():
     if transcript:
         st.success("Done!")
         st.text_area("Transcript", transcript, height=300, key="upload_text")
+        render_transcript_insights(transcript)
         save_to_library(dest, transcript, uploaded_file, "audio.wav")
         st.download_button(
             "⬇️ Download transcript (.txt)",
