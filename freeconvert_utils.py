@@ -70,9 +70,18 @@ def convert_audio_with_freeconvert(audio_bytes: bytes, filename: str, output_for
     except requests.RequestException as exc:
         raise RuntimeError(f"FreeConvert request failed: {exc}") from exc
 
-    if response.status_code != 200:
+    if response.status_code not in {200, 201}:
         raise RuntimeError(
             f"FreeConvert returned HTTP {response.status_code}: {response.text[:300]}"
         )
 
-    return response.json()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return payload
+
+    if payload.get("status") == "processing" and payload.get("id"):
+        payload["message"] = (
+            "Conversion job accepted. Check the job status using the returned ID or link."
+        )
+
+    return payload
